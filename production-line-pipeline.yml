@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: BuildConfig
+metadata:
+  labels:
+    app: cicd-pipeline
+    name: cicd-pipeline
+  name: tasks-pipeline
+spec:
+  triggers:
+    - type: GitHub
+      github:
+        secret: secret101
+    - type: Generic
+      generic:
+        secret: secret101
+  runPolicy: Serial
+  source:
+    type: None
+  strategy:
+    type: JenkinsPipeline
+    jenkinsPipelineStrategy:
+      jenkinsfile: |-
+      node('maven') {
+           def mvnCmd = "mvn -s configuration/cicd-settings.xml"
+
+           stage ('Build') {
+             git branch: 'eap-7', url: 'http://gogs:3000/adil/tasks.git'
+             sh "${mvnCmd} clean install -DskipTests=true"
+           }
+
+           stage ('Test') {
+              sh "${mvnCmd} test"
+              step([$class: 'JUnitResultArchiver', testResults: '**/target/surefire-reports/TEST-*.xml'])
+           }
+
+           stage ('Push to Nexus') {
+            sh "${mvnCmd} deploy -DskipTests=true"
+           }
+
+           stage ('Deploy DEV') {
+             sh "rm -rf oc-build && mkdir -p oc-build/deployments"
+             sh "cp target/openshift-tasks.war oc-build/deployments/ROOT.war"
+             sh "oc project production-line-dev"
+             // clean up. keep the image stream
+             sh "oc delete bc,dc,svc,route -l app=tasks -n production-line-dev"
+             // create build. override the exit code since it complains about exising imagestream
+             sh "oc new-build --name=tasks --image-stream=jboss-eap70-openshift --binary=true --labels=app=tasks -n production-line-dev || true"
+             // build image
+             sh "oc start-build tasks --from-dir=oc-build --wait=true -n production-line-dev"
+             // deploy image
+             sh "oc new-app tasks:latest -n production-line-dev"
+             sh "oc expose svc/tasks -n production-line-dev"
+           }
+
+           stage ('Deploy STAGE') {
+             input message: "Promote to STAGE?", ok: "Promote"
+
+             sh "oc project production-line-stage"
+             // clean up. keep the imagestream
+             sh "oc tag production-line-dev/tasks:latest production-line-stage/tasks:promoteToStage"
+             sh "oc delete bc,dc,svc,route -l app=tasks -n production-line-stage"
+             // deploy stage image
+             sh "oc new-app tasks:promoteToStage -n production-line-stage"
+             sh "oc expose svc/tasks -n production-line-stage"
+           }
+        }
